@@ -13,7 +13,7 @@ jobs:
       - name: swiftc -parse
         run: |
           swift --version
-          swiftc -parse Sources/main.swift && echo "语法 OK"
+          swiftc -parse -parse-as-library Sources/App.swift && echo "语法 OK"
 
   # 多个 macOS 标签一起排：不支持的会被秒拒（configuration not supported），能调起机器的才跑。
   # fail-fast: false → 任何一个出包就够。
