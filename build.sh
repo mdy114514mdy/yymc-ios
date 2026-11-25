@@ -14,7 +14,7 @@ xcrun --sdk iphoneos swiftc \
   -target arm64-apple-ios${MIN_IOS} \
   -O -sdk "$SDK" \
   -framework UIKit -framework WebKit -framework Network \
-  Sources/main.swift \
+  -parse-as-library \n  Sources/App.swift \
   -o "$APP_NAME"
 
 echo "== 组装 .app"

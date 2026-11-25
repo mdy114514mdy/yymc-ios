@@ -137,7 +137,7 @@ final class LocalServer {
                 send(conn, "416 Range Not Satisfiable", "text/plain; charset=utf-8", Data("range".utf8))
                 return
             }
-            let sub = data.subdata(in: start...(end))
+            let sub = data.subdata(in: start..<(end + 1))
             let extra = "Content-Range: bytes \(start)-\(end)/\(data.count)\r\n"
             send(conn, "206 Partial Content", contentType(for: path), sub, extra: extra)
         } else {
