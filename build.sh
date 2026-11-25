@@ -33,7 +33,8 @@ fi
 cp -R site "Payload/$APP_NAME.app/site"
 
 echo "== 打包 ipa"
-( cd Payload && zip -qry "../$APP_NAME.ipa" "$APP_NAME.app" )
+rm -f "$APP_NAME.ipa"
+zip -qry "$APP_NAME.ipa" Payload
 
 echo "== 结果"
 du -sh "Payload/$APP_NAME.app" || true
