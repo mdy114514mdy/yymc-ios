@@ -5,18 +5,30 @@ on:
   workflow_dispatch:
 
 jobs:
+  # 两个 macOS 标签都排上：macos-14 之前被直接拒（配置不受支持），macos-13 会排队；
+  # fail-fast: false 让任何一个成功就够，另一个排队/失败都不影响产物。
   build:
-    runs-on: macos-14
-    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
-      - name: 取游戏资源（来自 yymc-desktop 的 site/）
+      - name: 环境信息
+        run: |
+          uname -a
+          xcodebuild -version || true
+          xcrun --sdk iphoneos --show-sdk-path || true
+
+      - name: 取游戏资源（yymc-desktop 的 site/）
         run: |
           git clone --depth 1 https://github.com/mdy114514mdy/yymc-desktop.git _site_src
           cp -R _site_src/site ./site
           du -sh ./site
-          ls ./site | head
+          ls ./site
 
       - name: 编译并打包
         run: bash build.sh
@@ -24,6 +36,6 @@ jobs:
       - name: 上传 ipa
         uses: actions/upload-artifact@v4
         with:
-          name: yymc-ios-ipa
+          name: yymc-ios-ipa-${{ matrix.os }}
           path: YYMC.ipa
           if-no-files-found: error

@@ -1,5 +1,5 @@
-// YYMC iOS：WKWebView + App 内回环 HTTP 服务（与安卓版同一思路）
-// 页面从 http://127.0.0.1:8720 加载，所以是同源 http，fetch / Worker / WebAudio 都正常。
+// YYMC iOS：WKWebView + App 内的回环静态服务
+// 页面从 http://127.0.0.1:8720 加载 → 同源 http，fetch / Worker / WebAudio 都正常；不需要 JIT、不碰私有 API。
 import UIKit
 import WebKit
 import Network
@@ -11,6 +11,7 @@ final class LocalServer {
     private let root: URL
     private let port: UInt16
     private var listener: NWListener?
+    private(set) var running = false
 
     init(root: URL, port: UInt16) {
         self.root = root
@@ -18,23 +19,31 @@ final class LocalServer {
     }
 
     func start() throws {
-        guard let p = NWEndpoint.Port(rawValue: port) else { return }
-        let l = try NWListener(using: .tcp, on: p)
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
+        let l = try NWListener(using: .tcp, on: nwPort)
         l.newConnectionHandler = { [weak self] conn in
-            conn.start(queue: .global(qos: .userInitiated))
+            conn.start(queue: DispatchQueue.global(qos: .userInitiated))
             self?.readHead(conn, buffer: Data())
         }
-        l.start(queue: .global(qos: .userInitiated))
+        l.stateUpdateHandler = { [weak self] state in
+            if case .ready = state { self?.running = true }
+        }
+        l.start(queue: DispatchQueue.global(qos: .userInitiated))
         listener = l
     }
 
     private func readHead(_ conn: NWConnection, buffer: Data) {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
-            guard let self = self else { return }
+            guard let self = self else {
+                conn.cancel()
+                return
+            }
             var buf = buffer
-            if let d = data { buf.append(d) }
-            if let r = buf.range(of: Data([13, 10, 13, 10])) {
-                let head = String(decoding: buf[buf.startIndex..<r.lowerBound], as: UTF8.self)
+            if let d = data {
+                buf.append(d)
+            }
+            if let sep = buf.range(of: Data([13, 10, 13, 10])) {
+                let head = String(decoding: buf[buf.startIndex..<sep.lowerBound], as: UTF8.self)
                 self.respond(conn, head: head)
                 return
             }
@@ -46,7 +55,7 @@ final class LocalServer {
         }
     }
 
-    private func mime(_ path: String) -> String {
+    private func contentType(for path: String) -> String {
         let ext = (path as NSString).pathExtension.lowercased()
         switch ext {
         case "html", "htm": return "text/html; charset=utf-8"
@@ -65,30 +74,55 @@ final class LocalServer {
 
     private func respond(_ conn: NWConnection, head: String) {
         let lines = head.components(separatedBy: "\r\n")
-        guard let first = lines.first else { return conn.cancel() }
-        let parts = first.split(separator: " ")
-        guard parts.count >= 2 else { return conn.cancel() }
+        if lines.isEmpty {
+            conn.cancel()
+            return
+        }
+        let parts = lines[0].split(separator: " ")
+        if parts.count < 2 {
+            conn.cancel()
+            return
+        }
 
         var path = String(parts[1])
-        if let q = path.firstIndex(of: "?") { path = String(path[path.startIndex..<q]) }
-        if path == "/" || path.isEmpty { path = "/index.html" }
-        while path.hasPrefix("/") { path.removeFirst() }
-        if path.contains("..") { return send(conn, "403 Forbidden", "text/plain", Data("forbidden".utf8)) }
+        if let q = path.firstIndex(of: "?") {
+            path = String(path[path.startIndex..<q])
+        }
+        if let h = path.firstIndex(of: "#") {
+            path = String(path[path.startIndex..<h])
+        }
+        if path.isEmpty || path == "/" {
+            path = "/index.html"
+        }
+        while path.hasPrefix("/") {
+            path.removeFirst()
+        }
+        if path.contains("..") {
+            send(conn, "403 Forbidden", "text/plain; charset=utf-8", Data("forbidden".utf8))
+            return
+        }
 
         let fileURL = root.appendingPathComponent(path)
-        guard let data = try? Data(contentsOf: fileURL) else {
-            return send(conn, "404 Not Found", "text/plain", Data("404 \(path)".utf8))
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL)
+        } catch {
+            send(conn, "404 Not Found", "text/plain; charset=utf-8", Data("404 \(path)".utf8))
+            return
+        }
+        if data.isEmpty {
+            send(conn, "404 Not Found", "text/plain; charset=utf-8", Data("empty \(path)".utf8))
+            return
         }
 
         var start = 0
         var end = data.count - 1
         var partial = false
-        for l in lines.dropFirst() {
-            let low = l.lowercased()
-            if low.hasPrefix("range:") {
-                let v = l.dropFirst(6).trimmingCharacters(in: .whitespaces)
-                if v.hasPrefix("bytes=") {
-                    let spec = v.dropFirst(6).split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        for line in lines.dropFirst() {
+            if line.lowercased().hasPrefix("range:") {
+                let value = line.dropFirst(6).trimmingCharacters(in: .whitespaces)
+                if value.hasPrefix("bytes=") {
+                    let spec = value.dropFirst(6).split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
                     if spec.count == 2 {
                         if let a = Int(spec[0]) { start = a }
                         if let b = Int(spec[1]) { end = min(b, data.count - 1) }
@@ -97,37 +131,39 @@ final class LocalServer {
                 }
             }
         }
+
         if partial {
             if start < 0 || start >= data.count || start > end {
-                return send(conn, "416 Range Not Satisfiable", "text/plain", Data("range".utf8))
+                send(conn, "416 Range Not Satisfiable", "text/plain; charset=utf-8", Data("range".utf8))
+                return
             }
             let sub = data.subdata(in: start...(end))
-            send(conn, "206 Partial Content", mime(path), sub,
-                 extra: "Content-Range: bytes \(start)-\(end)/\(data.count)\r\n")
+            let extra = "Content-Range: bytes \(start)-\(end)/\(data.count)\r\n"
+            send(conn, "206 Partial Content", contentType(for: path), sub, extra: extra)
         } else {
-            send(conn, "200 OK", mime(path), data)
+            send(conn, "200 OK", contentType(for: path), data)
         }
     }
 
-    private func send(_ conn: NWConnection, _ status: String, _ type: String, _ body: Data,
-                      extra: String = "") {
+    private func send(_ conn: NWConnection, _ status: String, _ type: String, _ body: Data, extra: String = "") {
         var head = "HTTP/1.1 \(status)\r\n"
         head += "Content-Type: \(type)\r\n"
         head += "Content-Length: \(body.count)\r\n"
         head += "Accept-Ranges: bytes\r\n"
         head += "Access-Control-Allow-Origin: *\r\n"
-        head += "Cache-Control: \(type.hasPrefix("text/html") ? "no-cache" : "public, max-age=31536000")\r\n"
         head += extra
         head += "Connection: close\r\n\r\n"
         var out = Data(head.utf8)
         out.append(body)
-        conn.send(content: out, completion: .contentProcessed { _ in conn.cancel() })
+        conn.send(content: out, completion: .contentProcessed { _ in
+            conn.cancel()
+        })
     }
 }
 
 // MARK: - 页面
 
-final class ViewController: UIViewController {
+final class ViewController: UIViewController, WKNavigationDelegate {
 
     private var web: WKWebView!
     private var server: LocalServer?
@@ -141,43 +177,52 @@ final class ViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = .black
 
-        let cfg = WKWebViewConfiguration()
-        cfg.allowsInlineMediaPlayback = true
-        cfg.mediaTypesRequiringUserActionForPlayback = []
+        let config = WKWebViewConfiguration()
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
 
-        web = WKWebView(frame: view.bounds, configuration: cfg)
+        web = WKWebView(frame: view.bounds, configuration: config)
         web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         web.scrollView.isScrollEnabled = false
         web.scrollView.bounces = false
         web.isOpaque = false
         web.backgroundColor = .black
+        web.navigationDelegate = self
         view.addSubview(web)
 
-        if let site = Bundle.main.resourceURL?.appendingPathComponent("site") {
-            let s = LocalServer(root: site, port: port)
-            do {
-                try s.start()
-                server = s
-            } catch {
-                showError("本地服务启动失败：\(error)")
-            }
-        } else {
-            showError("安装包内没有 site/ 资源")
+        guard let site = Bundle.main.resourceURL?.appendingPathComponent("site") else {
+            showError("安装包里没有 site/ 资源")
+            return
         }
-
+        let s = LocalServer(root: site, port: port)
+        do {
+            try s.start()
+            server = s
+        } catch {
+            showError("本地服务启动失败：\(error.localizedDescription)")
+            return
+        }
         if let url = URL(string: "http://127.0.0.1:\(port)/index.html") {
             web.load(URLRequest(url: url))
         }
     }
 
-    private func showError(_ msg: String) {
-        let label = UILabel(frame: view.bounds)
-        label.text = msg
-        label.textColor = .systemRed
-        label.backgroundColor = .black
-        label.numberOfLines = 0
-        label.textAlignment = .center
-        view.addSubview(label)
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        showError("页面加载失败：\(error.localizedDescription)\n确认 site/ 里有 index.html")
+    }
+
+    private func showError(_ message: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let label = UILabel(frame: self.view.bounds)
+            label.text = message
+            label.textColor = UIColor(red: 1, green: 0.5, blue: 0.5, alpha: 1)
+            label.backgroundColor = .black
+            label.numberOfLines = 0
+            label.textAlignment = .center
+            label.font = UIFont.systemFont(ofSize: 14)
+            self.view.addSubview(label)
+        }
     }
 }
 
