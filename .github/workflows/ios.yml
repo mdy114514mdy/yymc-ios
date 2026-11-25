@@ -5,6 +5,16 @@ on:
   workflow_dispatch:
 
 jobs:
+  # 语法自检：ubuntu 上预装 Swift，-parse 不需要 iOS SDK，能在几分钟内报出语法错
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: swiftc -parse
+        run: |
+          swift --version
+          swiftc -parse Sources/main.swift && echo "语法 OK"
+
   # 两个 macOS 标签都排上：macos-14 之前被直接拒（配置不受支持），macos-13 会排队；
   # fail-fast: false 让任何一个成功就够，另一个排队/失败都不影响产物。
   build:
