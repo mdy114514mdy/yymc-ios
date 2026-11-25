@@ -1,0 +1,29 @@
+name: build-ipa
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取游戏资源（来自 yymc-desktop 的 site/）
+        run: |
+          git clone --depth 1 https://github.com/mdy114514mdy/yymc-desktop.git _site_src
+          cp -R _site_src/site ./site
+          du -sh ./site
+          ls ./site | head
+
+      - name: 编译并打包
+        run: bash build.sh
+
+      - name: 上传 ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: yymc-ios-ipa
+          path: YYMC.ipa
+          if-no-files-found: error

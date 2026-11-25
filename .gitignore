@@ -1,0 +1,6 @@
+site/
+_site_src/
+Payload/
+YYMC
+*.ipa
+*.app/
