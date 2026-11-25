@@ -15,13 +15,13 @@ jobs:
           swift --version
           swiftc -parse Sources/main.swift && echo "语法 OK"
 
-  # 两个 macOS 标签都排上：macos-14 之前被直接拒（配置不受支持），macos-13 会排队；
-  # fail-fast: false 让任何一个成功就够，另一个排队/失败都不影响产物。
+  # 多个 macOS 标签一起排：不支持的会被秒拒（configuration not supported），能调起机器的才跑。
+  # fail-fast: false → 任何一个出包就够。
   build:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-13, macos-14]
+        os: [macos-15, macos-15-large, macos-15-xlarge, macos-14, macos-13]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 350
     steps:
