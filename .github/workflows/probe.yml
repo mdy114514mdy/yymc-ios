@@ -4,8 +4,8 @@ jobs:
   u:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "ubuntu ok"
-  m:
-    runs-on: macos-14
+      - run: echo "ubuntu ok"; uname -a
+  m13:
+    runs-on: macos-13
     steps:
-      - run: echo "macos ok"; xcodebuild -version || true
+      - run: echo "macos13 ok"; xcodebuild -version || true
