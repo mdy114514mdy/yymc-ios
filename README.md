@@ -8,8 +8,9 @@
 
 | 版本 | 文件 | 大小 | 直链 |
 |---|---|---|---|
-| v1.1.0 | `YYMC.ipa` | 104.0 MB | https://github.com/mdy114514mdy/yymc-ios/releases/download/v1.1.0/YYMC.ipa |
-| v1.1.0 | 整页 | — | https://github.com/mdy114514mdy/yymc-ios/releases/tag/v1.1.0 |
+| **v1.1.1** | `YYMC.ipa` | 104.0 MB | https://github.com/mdy114514mdy/yymc-ios/releases/download/v1.1.1/YYMC.ipa |
+| v1.1.1 | 整页（含更新记录） | — | https://github.com/mdy114514mdy/yymc-ios/releases/tag/v1.1.1 |
+| v1.1.0 | `YYMC.ipa`（旧版） | 104.0 MB | https://github.com/mdy114514mdy/yymc-ios/releases/download/v1.1.0/YYMC.ipa |
 
 > ipa 是 **unsigned** 的，安装时必须本机签名（Sideloadly / AltStore / 自己的证书）。
 
@@ -56,7 +57,14 @@ build.sh                       swiftc 编译 → 组 .app → 打 ipa（根必�
 .github/workflows/ios.yml      CI：语法检查 + macos-15 出包 + 上传 artifact
 ```
 
-## 五、已知坑
+## 五、更新记录
+
+| 版本 | 变化 |
+|---|---|
+| **v1.1.1** | **修区块"永久毒化"**（与桌面/安卓同一修复）；包内游戏本体 50,849,251 B，已含 `poisonStage` / `gaveUp` |
+| v1.1.0 | 首次发布：设备内回环（静态 + `/rooms/api` 反代 + `/rooms/p2p` WS 隧道），真机验证登录/云存档/开房间 |
+
+## 六、已知坑
 
 1. `@main` 的文件不能叫 `main.swift`（会被当成顶层代码入口），本仓库用 `App.swift` + `-parse-as-library`。
 2. `Data.subdata(in:)` 要 `Range`，不是 `ClosedRange`（写 `start..<(end+1)`）。
