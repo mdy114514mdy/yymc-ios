@@ -1,12 +1,20 @@
-// YYMC iOS：WKWebView + App 内的回环服务（静态文件 + /rooms 反代 + /rooms/p2p 的 WebSocket 隧道）
-// 页面从 http://127.0.0.1:8720 加载 → 同源 http，fetch / Worker / WebAudio 都正常；不需要 JIT、不碰私有 API。
+// YYMC iOS：WKWebView + App 内的回环服务
+//   · 静态资源：bundle 里的 site/（支持 Range）
+//   · /rooms/api/*：用 URLSession 反代到官方房间服务，补 Origin 白名单头
+//   · /rooms/p2p：WebSocket 隧道（本地替浏览器完成握手，再与上游对接，之后原样搬字节）
 //
-// 为什么要这层反代：官方房间服务只认 Origin: https://www.bilibili.com，
-// 而 Origin 是浏览器的 forbidden header，页面 JS 改不了，所以必须由 App 在浏览器之外补上。
-// 全流程都在设备内完成，不依赖任何云端中转。
+// 为什么要这层：官方服务只认 Origin: https://www.bilibili.com，而 Origin 是浏览器的 forbidden header，
+// 页面 JS 改不了（WebSocket 握手也无法设置 header），所以必须在浏览器之外补。全程在设备内，不依赖云端。
 import UIKit
 import WebKit
 import Network
+import CryptoKit
+import Security
+
+private let kOrigin = "https://www.bilibili.com"
+private let kUpHost = "xz.honghemc.cn"
+private let kUpPort: UInt16 = 8443
+private let kWsGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 // MARK: - 回环服务
 
@@ -15,10 +23,6 @@ final class LocalServer {
     private let root: URL
     private let port: UInt16
     private var listener: NWListener?
-
-    private let upstreamHost = "xz.honghemc.cn"
-    private let upstreamPort: UInt16 = 8443
-    private let upOrigin = "https://www.bilibili.com"
 
     init(root: URL, port: UInt16) {
         self.root = root
@@ -36,7 +40,7 @@ final class LocalServer {
         listener = l
     }
 
-    // MARK: 读请求头 + body
+    // MARK: - 读请求
 
     private func readRequest(_ conn: NWConnection, buffer: Data) {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
@@ -45,9 +49,7 @@ final class LocalServer {
                 return
             }
             var buf = buffer
-            if let d = data {
-                buf.append(d)
-            }
+            if let d = data { buf.append(d) }
 
             guard let sep = buf.range(of: Data([13, 10, 13, 10])) else {
                 if error != nil || isComplete || buf.count > 65536 {
@@ -72,15 +74,18 @@ final class LocalServer {
             let method = String(parts[0])
             let target = String(parts[1])
 
-            var contentLength = 0
+            var headers: [String: String] = [:]
             for line in lines.dropFirst() {
-                if line.lowercased().hasPrefix("content-length:") {
-                    contentLength = Int(line.dropFirst(15).trimmingCharacters(in: .whitespaces)) ?? 0
-                }
+                guard let colon = line.firstIndex(of: ":") else { continue }
+                let key = line[line.startIndex..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+                let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+                headers[key] = value
             }
 
-            let afterHead = buf[sep.upperBound...]
-            if afterHead.count < contentLength {
+            let contentLength = Int(headers["content-length"] ?? "0") ?? 0
+            let remainder = Data(buf[sep.upperBound...])
+
+            if remainder.count < contentLength {
                 if error != nil || isComplete {
                     conn.cancel()
                 } else {
@@ -88,44 +93,47 @@ final class LocalServer {
                 }
                 return
             }
-            let needed = min(contentLength, afterHead.count)
-            let body = needed > 0 ? Data(afterHead.prefix(needed)) : Data()
+            let body = contentLength > 0 ? Data(remainder.prefix(contentLength)) : Data()
+            let afterBody = contentLength > 0 ? Data(remainder.dropFirst(contentLength)) : remainder
 
-            self.dispatch(conn, method: method, target: target, body: body, headers: lines)
+            self.dispatch(conn, method: method, target: target, headers: headers, body: body, carried: afterBody)
         }
     }
 
-    private func dispatch(_ conn: NWConnection, method: String, target: String, body: Data,
-                          headers: [String]) {
+    private func dispatch(_ conn: NWConnection, method: String, target: String,
+                          headers: [String: String], body: Data, carried: Data) {
         var path = target
-        if let q = path.firstIndex(of: "?") {
-            path = String(path[path.startIndex..<q])
-        }
+        if let q = path.firstIndex(of: "?") { path = String(path[path.startIndex..<q]) }
 
-        if path.hasPrefix("/rooms/p2p") {
-            rejectTunnel(conn)
+        if path == "/rooms/p2p" {
+            let key = headers["sec-websocket-key"] ?? ""
+            if key.isEmpty {
+                sendResponse(conn, "400 Bad Request", "text/plain; charset=utf-8", Data("no ws key".utf8))
+                return
+            }
+            tunnel(conn, target: target, clientKey: key, carried: carried)
             return
         }
         if path.hasPrefix("/rooms/") {
             proxyHTTP(conn, method: method, fullTarget: target, body: body)
             return
         }
-        serveFile(conn, target: target, method: method, headers: headers)
+        serveFile(conn, target: target, headers: headers)
     }
 
-    // MARK: /rooms/api/* 反代（URLSession，补 Origin）
+    // MARK: - /rooms/api/* HTTP 反代
 
     private func proxyHTTP(_ conn: NWConnection, method: String, fullTarget: String, body: Data) {
         let upstreamPath = String(fullTarget.dropFirst("/rooms".count))
-        guard let url = URL(string: "https://\(upstreamHost):\(upstreamPort)\(upstreamPath)") else {
+        guard let url = URL(string: "https://\(kUpHost):\(kUpPort)\(upstreamPath)") else {
             sendResponse(conn, "400 Bad Request", "text/plain; charset=utf-8", Data("bad url".utf8))
             return
         }
         var req = URLRequest(url: url)
         req.httpMethod = method
         req.timeoutInterval = 30
-        req.setValue(upOrigin, forHTTPHeaderField: "Origin")
-        req.setValue(upOrigin + "/", forHTTPHeaderField: "Referer")
+        req.setValue(kOrigin, forHTTPHeaderField: "Origin")
+        req.setValue(kOrigin + "/", forHTTPHeaderField: "Referer")
         req.setValue("YYMC-iOS", forHTTPHeaderField: "User-Agent")
         if !body.isEmpty {
             req.httpBody = body
@@ -133,10 +141,7 @@ final class LocalServer {
         }
 
         URLSession.shared.dataTask(with: req) { [weak self] data, response, error in
-            guard let self = self else {
-                conn.cancel()
-                return
-            }
+            guard let self = self else { conn.cancel(); return }
             if let error = error {
                 let msg = "{\"error\":\"relay: \(error.localizedDescription)\"}"
                 self.sendResponse(conn, "502 Bad Gateway", "application/json; charset=utf-8", Data(msg.utf8))
@@ -149,17 +154,135 @@ final class LocalServer {
         }.resume()
     }
 
-    // MARK: /rooms/p2p —— 这一版还没做 WebSocket 隧道，明确回 501，别让客户端以为网络挂了
-    private func rejectTunnel(_ conn: NWConnection) {
-        let msg = "{\"error\":\"联机信令需要 WebSocket 隧道，这一版还没实现（登录/云存档可用）\"}"
-        sendResponse(conn, "501 Not Implemented", "application/json; charset=utf-8", Data(msg.utf8))
+    // MARK: - /rooms/p2p WebSocket 隧道
+
+    private func tunnel(_ conn: NWConnection, target: String, clientKey: String, carried: Data) {
+        var path = target
+        if path.hasPrefix("/rooms") { path = String(path.dropFirst("/rooms".count)) }
+        if path.isEmpty { path = "/p2p" }
+
+        guard let nwPort = NWEndpoint.Port(rawValue: kUpPort) else {
+            sendResponse(conn, "500 Tunnel", "text/plain; charset=utf-8", Data("bad port".utf8))
+            return
+        }
+
+        let tls = NWProtocolTLS.Options()
+        sec_protocol_options_add_tls_application_protocol(tls.securityProtocolOptions, "http/1.1")
+        let params = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
+        let up = NWConnection(host: NWEndpoint.Host(kUpHost), port: nwPort, using: params)
+
+        // 浏览器那侧要的 accept：base64(sha1(它的 key + GUID))
+        let accept = Self.accept(for: clientKey)
+
+        up.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            switch state {
+            case .ready:
+                let hs = "GET \(path) HTTP/1.1\r\n"
+                    + "Host: \(kUpHost):\(kUpPort)\r\n"
+                    + "Upgrade: websocket\r\n"
+                    + "Connection: Upgrade\r\n"
+                    + "Sec-WebSocket-Version: 13\r\n"
+                    + "Sec-WebSocket-Key: \(Self.randomKey())\r\n"
+                    + "Origin: \(kOrigin)\r\n"
+                    + "Referer: \(kOrigin)/\r\n"
+                    + "\r\n"
+                up.send(content: Data(hs.utf8), completion: .contentProcessed { err in
+                    if err != nil {
+                        self.sendResponse(conn, "502 Tunnel", "text/plain; charset=utf-8", Data("send failed".utf8))
+                        up.cancel()
+                        return
+                    }
+                    self.waitUpstreamHandshake(conn, up: up, accept: accept, carried: carried)
+                })
+            case .failed, .cancelled:
+                self.sendResponse(conn, "502 Tunnel", "text/plain; charset=utf-8", Data("upstream unavailable".utf8))
+            default:
+                break
+            }
+        }
+        up.start(queue: DispatchQueue.global(qos: .userInitiated))
     }
 
-    // MARK: 静态文件
+    private func waitUpstreamHandshake(_ conn: NWConnection, up: NWConnection, accept: String, carried: Data) {
+        up.receive(minimumIncompleteLength: 1, maximumLength: 16384) { [weak self] data, _, _, error in
+            guard let self = self else { up.cancel(); conn.cancel(); return }
+            if error != nil || data == nil {
+                self.sendResponse(conn, "502 Tunnel", "text/plain; charset=utf-8", Data("no upstream response".utf8))
+                up.cancel()
+                return
+            }
+            let text = String(decoding: data!, as: UTF8.self)
+            guard text.hasPrefix("HTTP/1.1 101") || text.contains(" 101 ") else {
+                let firstLine = text.components(separatedBy: "\r\n").first ?? "?"
+                self.sendResponse(conn, "502 Tunnel", "text/plain; charset=utf-8",
+                                  Data("upstream refused: \(firstLine)".utf8))
+                up.cancel()
+                return
+            }
+
+            var resp = "HTTP/1.1 101 Switching Protocols\r\n"
+            resp += "Upgrade: websocket\r\n"
+            resp += "Connection: Upgrade\r\n"
+            resp += "Sec-WebSocket-Accept: \(accept)\r\n"
+            resp += "\r\n"
+
+            conn.send(content: Data(resp.utf8), completion: .contentProcessed { err in
+                if err != nil {
+                    up.cancel()
+                    conn.cancel()
+                    return
+                }
+                // 握手包里可能已经带了上游的首帧（以及客户端提前发来的字节），先各自转发再开始泵
+                if let r = data!.range(of: Data([13, 10, 13, 10])) {
+                    let tail = Data(data![r.upperBound...])
+                    if !tail.isEmpty { conn.send(content: tail, completion: .contentProcessed { _ in }) }
+                }
+                if !carried.isEmpty { up.send(content: carried, completion: .contentProcessed { _ in }) }
+                self.pump(from: up, to: conn)
+                self.pump(from: conn, to: up)
+            })
+        }
+    }
+
+    private func pump(from: NWConnection, to: NWConnection) {
+        from.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+            guard let self = self else { return }
+            if let d = data, !d.isEmpty {
+                to.send(content: d, completion: .contentProcessed { err in
+                    if err != nil {
+                        from.cancel()
+                        to.cancel()
+                        return
+                    }
+                    self.pump(from: from, to: to)
+                })
+                return
+            }
+            if error != nil || isComplete {
+                from.cancel()
+                to.cancel()
+            } else {
+                self.pump(from: from, to: to)
+            }
+        }
+    }
+
+    private static func accept(for key: String) -> String {
+        let digest = Insecure.SHA1.hash(data: Data((key + kWsGuid).utf8))
+        return Data(digest).base64EncodedString()
+    }
+
+    private static func randomKey() -> String {
+        var bytes = [UInt8](repeating: 0, count: 16)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return Data(bytes).base64EncodedString()
+    }
+
+    // MARK: - 静态文件
 
     private func contentType(for path: String) -> String {
-        let ext = (path as NSString).pathExtension.lowercased()
-        switch ext {
+        switch (path as NSString).pathExtension.lowercased() {
         case "html", "htm": return "text/html; charset=utf-8"
         case "js", "mjs": return "text/javascript; charset=utf-8"
         case "css": return "text/css; charset=utf-8"
@@ -174,7 +297,7 @@ final class LocalServer {
         }
     }
 
-    private func serveFile(_ conn: NWConnection, target: String, method: String, headers: [String]) {
+    private func serveFile(_ conn: NWConnection, target: String, headers: [String: String]) {
         var path = target
         if let q = path.firstIndex(of: "?") { path = String(path[path.startIndex..<q]) }
         if let h = path.firstIndex(of: "#") { path = String(path[path.startIndex..<h]) }
@@ -194,17 +317,12 @@ final class LocalServer {
         var start = 0
         var end = data.count - 1
         var partial = false
-        for line in headers {
-            if line.lowercased().hasPrefix("range:") {
-                let value = line.dropFirst(6).trimmingCharacters(in: .whitespaces)
-                if value.hasPrefix("bytes=") {
-                    let spec = value.dropFirst(6).split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
-                    if spec.count == 2 {
-                        if let a = Int(spec[0]) { start = a }
-                        if let b = Int(spec[1]) { end = min(b, data.count - 1) }
-                        partial = true
-                    }
-                }
+        if let rangeHeader = headers["range"], rangeHeader.hasPrefix("bytes=") {
+            let spec = rangeHeader.dropFirst(6).split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+            if spec.count == 2 {
+                if let a = Int(spec[0]) { start = a }
+                if let b = Int(spec[1]) { end = min(b, data.count - 1) }
+                partial = true
             }
         }
 
@@ -221,7 +339,7 @@ final class LocalServer {
         }
     }
 
-    // MARK: 写响应
+    // MARK: - 写响应
 
     private func sendResponse(_ conn: NWConnection, _ status: String, _ type: String, _ body: Data,
                               extra: String = "") {
@@ -234,9 +352,7 @@ final class LocalServer {
         head += "Connection: close\r\n\r\n"
         var out = Data(head.utf8)
         out.append(body)
-        conn.send(content: out, completion: .contentProcessed { _ in
-            conn.cancel()
-        })
+        conn.send(content: out, completion: .contentProcessed { _ in conn.cancel() })
     }
 }
 
